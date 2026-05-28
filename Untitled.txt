@@ -301,3 +301,70 @@ ORDER BY
     COALESCE(s.policy_no,        t.policy_no),
     COALESCE(s.tran_eff_dt,      t.tran_eff_dt),
     COALESCE(s.accounting_month, t.accounting_month);
+
+
+
+
+SELECT 
+    A.ACCOUNTING_DT, 
+    A.TRAN_EFF_DT, 
+    A.POLICY_NO, 
+    A.ACCOUNTING_MONTH, 
+    A.PREMIUM_LOSS_IND, 
+    A.SRM_AMOUNT, 
+    D.TRANS_AM, 
+    D.POLICY_TYPE_CD 
+FROM (
+    SELECT 
+        ACCOUNTING_DT, 
+        TRAN_EFF_DT, 
+        POLICY_NO, 
+        ACCOUNTING_MONTH, 
+        PREMIUM_LOSS_IND, 
+        SUM(TRAN_AM) AS SRM_AMOUNT 
+    FROM stage_misreg.STAGE_SRM_PREMIUM_LOSS 
+    WHERE POLICY_NO IN (
+        '2500000433', '2500000413', '9394501580', '4500001881', '3620000723',
+        '5390003513', '5390004108', '5390004110', '2500000430', '9394501690', 
+        '4500001853', '3620000716', '5390004129', '0063100349', '2500000426', 
+        '0025085481', '5390004309', '5390003696', '5390003699', '2500000448'
+    ) 
+    GROUP BY 
+        ACCOUNTING_DT, 
+        TRAN_EFF_DT, 
+        POLICY_NO, 
+        ACCOUNTING_MONTH, 
+        PREMIUM_LOSS_IND
+) A 
+JOIN (
+    SELECT 
+        SUM(T.PREMIUM_AM) AS TRANS_AM, 
+        P.POLICY_NO, 
+        TO_CHAR(P.INCEPTION_DT, 'yyyymmdd') AS POLICY_EFF_DT, 
+        P.POLICY_TYPE_CD 
+    FROM ttransaction T
+    JOIN tpolicy P ON T.policy_sk = P.policy_sk
+    JOIN tdate c ON T.calendar_month_sk = c.date_sk
+    WHERE T.EFFECTIVE_DT_SK <= c.date_sk 
+      AND c.date_sk IN (9405, 9436) 
+      AND P.POLICY_NO IN (
+          '2500000433', '2500000413', '9394501580', '4500001881', '3620000723',
+          '5390003513', '5390004108', '5390004110', '2500000430', '9394501690', 
+          '4500001853', '3620000716', '5390004129', '0063100349', '2500000426', 
+          '0025085481', '5390004309', '5390003696', '5390003699', '2500000448'
+      ) 
+      AND T.SOURCE_SYSTEM_SK IN (20, 21) 
+      AND T.TAX_FEE_SRCHRG_AM = 0 
+      AND T.EFFECTIVE_DT_SK <> 9436 
+      AND T.COVERAGE_SK <> '0' 
+    GROUP BY 
+        P.POLICY_NO, 
+        TO_CHAR(P.INCEPTION_DT, 'yyyymmdd'), 
+        P.POLICY_TYPE_CD
+) D 
+ON A.POLICY_NO = D.POLICY_NO 
+AND A.TRAN_EFF_DT = D.POLICY_EFF_DT 
+ORDER BY 
+    A.POLICY_NO, 
+    A.TRAN_EFF_DT, 
+    A.ACCOUNTING_DT;
