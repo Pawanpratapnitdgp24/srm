@@ -107,3 +107,197 @@ ORDER BY
     COALESCE(s.policy_no, t.policy_no),
     COALESCE(s.tran_eff_dt, t.tran_eff_dt),
     COALESCE(s.accounting_month, t.accounting_month);
+
+
+
+
+
+
+
+
+
+
+
+WITH policy_list AS (
+    SELECT '2500000433' policy_no FROM dual UNION ALL
+    SELECT '2500000413' FROM dual UNION ALL
+    SELECT '9394501580' FROM dual UNION ALL
+    SELECT '4500001881' FROM dual UNION ALL
+    SELECT '3620000723' FROM dual UNION ALL
+    SELECT '5390003513' FROM dual UNION ALL
+    SELECT '5390004108' FROM dual UNION ALL
+    SELECT '5390004110' FROM dual UNION ALL
+    SELECT '2500000430' FROM dual UNION ALL
+    SELECT '9394501690' FROM dual UNION ALL
+    SELECT '4500001853' FROM dual UNION ALL
+    SELECT '3620000716' FROM dual UNION ALL
+    SELECT '5390004129' FROM dual UNION ALL
+    SELECT '0063100349' FROM dual UNION ALL
+    SELECT '2500000426' FROM dual UNION ALL
+    SELECT '0025085481' FROM dual UNION ALL
+    SELECT '5390004309' FROM dual UNION ALL
+    SELECT '5390003696' FROM dual UNION ALL
+    SELECT '5390003699' FROM dual UNION ALL
+    SELECT '2500000448' FROM dual
+),
+
+srm AS (
+    SELECT
+        accounting_dt,
+        tran_eff_dt,
+        policy_no,
+        accounting_month,
+        premium_loss_ind,
+        SUM(tran_am) AS srm_amount
+    FROM stage_misreg.stage_srm_premium_loss
+    WHERE policy_no IN (SELECT policy_no FROM policy_list)
+    GROUP BY
+        accounting_dt,
+        tran_eff_dt,
+        policy_no,
+        accounting_month,
+        premium_loss_ind
+),
+
+target_months AS (
+    SELECT DISTINCT accounting_month
+    FROM srm
+),
+
+/*
+ * trans CTE is split into two UNION ALL branches because the SRM procedure
+ * uses fundamentally different date-filtering logic per source system family:
+ *
+ *  Branch A — Instanda (source_system_sk IN 18,19,20,21):
+ *    prc_premium_feed_load uses effective_dt (t2) and transaction_dt (t3)
+ *    pcs_month_acctng_ct logic (US536949 backdated-transaction fix).
+ *
+ *  Branch B — Non-Instanda / CIP (source_system_sk IN 16,17):
+ *    prc_premium_feed_load uses accounting_dt year_month_ct = in_ym.
+ *
+ * Both branches subtract tax_fee_srchrg_am to match what SRM actually writes
+ * into the flat file and therefore into stage_srm_premium_loss.tran_am.
+ */
+
+trans AS (
+
+    /* ── Branch A: Instanda (source_system_sk 18-21) ── */
+    SELECT
+        tm.accounting_month,
+        TO_CHAR(t_eff.actual_dt, 'yyyymmdd')                          AS tran_eff_dt,
+        p.policy_no,
+        p.policy_type_cd,
+        -- FIX #2: subtract tax_fee_srchrg_am — SRM sends (premium_am - tax_fee_srchrg_am)
+        SUM(t.premium_am - NVL(t.tax_fee_srchrg_am, 0))               AS trans_am
+    FROM ttransaction t
+    JOIN tpolicy p
+        ON t.policy_sk = p.policy_sk
+    JOIN tdate t_eff
+        ON t.effective_dt_sk = t_eff.date_sk
+    JOIN tdate t_tran
+        ON t.transaction_dt_sk = t_tran.date_sk
+    JOIN target_months tm
+        ON (
+            (
+                t_eff.pcs_month_acctng_ct  = tm.accounting_month
+                AND t_tran.pcs_month_acctng_ct <= tm.accounting_month
+            )
+            OR (
+                t_eff.pcs_month_acctng_ct  < tm.accounting_month
+                AND t_tran.pcs_month_acctng_ct = tm.accounting_month
+            )
+        )
+    WHERE p.policy_no IN (SELECT policy_no FROM policy_list)
+        -- FIX #1: was IN (20,21) only — now includes all Instanda source systems
+        AND p.source_system_sk IN (18, 19, 20, 21)
+        AND p.policy_type_cd IN (
+            'HO', 'CHO', 'AU', 'PE', 'EXFL', 'PC', 'EQ', 'CAU', 'YHT'
+        )
+        AND (
+            p.policy_type_cd IN ('HO', 'CHO')   -- HO/CHO: allow zero rows; HAVING filters the group
+            OR t.premium_am <> 0                 -- all others: skip zero-premium rows
+        )
+    GROUP BY
+        tm.accounting_month,
+        TO_CHAR(t_eff.actual_dt, 'yyyymmdd'),
+        p.policy_no,
+        p.policy_type_cd
+    HAVING
+        (
+            p.policy_type_cd IN ('HO', 'CHO')
+            AND SUM(t.premium_am - NVL(t.tax_fee_srchrg_am, 0)) <> 0
+        )
+        OR p.policy_type_cd NOT IN ('HO', 'CHO')
+
+    UNION ALL
+
+    /* ── Branch B: Non-Instanda / CIP (source_system_sk 16-17) ── */
+    /* FIX #3: these use accounting_dt year_month_ct = in_ym, NOT the
+               effective/transaction-date pcs_month logic used above.      */
+    SELECT
+        t_acct.year_month_ct                                           AS accounting_month,
+        TO_CHAR(t_eff.actual_dt, 'yyyymmdd')                          AS tran_eff_dt,
+        p.policy_no,
+        p.policy_type_cd,
+        -- FIX #2 (same): subtract tax_fee_srchrg_am
+        SUM(t.premium_am - NVL(t.tax_fee_srchrg_am, 0))               AS trans_am
+    FROM ttransaction t
+    JOIN tpolicy p
+        ON t.policy_sk = p.policy_sk
+    JOIN tdate t_eff
+        ON t.effective_dt_sk = t_eff.date_sk
+    -- FIX #3: join on accounting_dt (not effective/transaction date) for this path
+    JOIN tdate t_acct
+        ON t.accounting_dt_sk = t_acct.date_sk
+    JOIN target_months tm
+        ON t_acct.year_month_ct = tm.accounting_month
+    WHERE p.policy_no IN (SELECT policy_no FROM policy_list)
+        -- FIX #1: source systems 16/17 were completely absent before
+        AND p.source_system_sk IN (16, 17)
+        AND p.source_system_sk NOT IN (2, 14)           -- matches SRM's own exclusion
+        -- FIX #5: full policy-type list for this path (includes EPLI, GRX)
+        AND p.policy_type_cd IN (
+            'HO', 'CHO', 'AU', 'PE', 'EPLI', 'EXFL', 'GRX', 'PC', 'EQ'
+        )
+        -- FIX #4: include taxfeesurcharge_sk = 3 fee-only rows (SRM includes them)
+        AND (
+            t.premium_am <> 0
+            OR t.taxfeesurcharge_sk = 3
+        )
+        AND (
+            p.policy_type_cd IN ('HO', 'CHO')
+            OR t.premium_am <> 0
+        )
+    GROUP BY
+        t_acct.year_month_ct,
+        TO_CHAR(t_eff.actual_dt, 'yyyymmdd'),
+        p.policy_no,
+        p.policy_type_cd
+    HAVING
+        (
+            p.policy_type_cd IN ('HO', 'CHO')
+            AND SUM(t.premium_am - NVL(t.tax_fee_srchrg_am, 0)) <> 0
+        )
+        OR p.policy_type_cd NOT IN ('HO', 'CHO')
+)
+
+SELECT
+    s.accounting_dt,
+    s.tran_eff_dt,
+    s.policy_no,
+    s.accounting_month,
+    s.premium_loss_ind,
+    s.srm_amount,
+    t.trans_am,
+    t.policy_type_cd,
+    NVL(s.srm_amount, 0) - NVL(t.trans_am, 0)                         AS amount_difference
+FROM srm s
+FULL OUTER JOIN trans t
+    ON  s.policy_no        = t.policy_no
+    AND s.tran_eff_dt      = t.tran_eff_dt
+    AND s.accounting_month = t.accounting_month
+WHERE NVL(s.srm_amount, 0) <> NVL(t.trans_am, 0)
+ORDER BY
+    COALESCE(s.policy_no,        t.policy_no),
+    COALESCE(s.tran_eff_dt,      t.tran_eff_dt),
+    COALESCE(s.accounting_month, t.accounting_month);
