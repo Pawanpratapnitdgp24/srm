@@ -1,0 +1,109 @@
+
+WITH policy_list AS (
+    SELECT '2500000433' policy_no FROM dual UNION ALL
+    SELECT '2500000413' FROM dual UNION ALL
+    SELECT '9394501580' FROM dual UNION ALL
+    SELECT '4500001881' FROM dual UNION ALL
+    SELECT '3620000723' FROM dual UNION ALL
+    SELECT '5390003513' FROM dual UNION ALL
+    SELECT '5390004108' FROM dual UNION ALL
+    SELECT '5390004110' FROM dual UNION ALL
+    SELECT '2500000430' FROM dual UNION ALL
+    SELECT '9394501690' FROM dual UNION ALL
+    SELECT '4500001853' FROM dual UNION ALL
+    SELECT '3620000716' FROM dual UNION ALL
+    SELECT '5390004129' FROM dual UNION ALL
+    SELECT '0063100349' FROM dual UNION ALL
+    SELECT '2500000426' FROM dual UNION ALL
+    SELECT '0025085481' FROM dual UNION ALL
+    SELECT '5390004309' FROM dual UNION ALL
+    SELECT '5390003696' FROM dual UNION ALL
+    SELECT '5390003699' FROM dual UNION ALL
+    SELECT '2500000448' FROM dual
+),
+srm AS (
+    SELECT
+        accounting_dt,
+        tran_eff_dt,
+        policy_no,
+        accounting_month,
+        premium_loss_ind,
+        SUM(tran_am) AS srm_amount
+    FROM stage_misreg.stage_srm_premium_loss
+    WHERE policy_no IN (SELECT policy_no FROM policy_list)
+    GROUP BY
+        accounting_dt,
+        tran_eff_dt,
+        policy_no,
+        accounting_month,
+        premium_loss_ind
+),
+target_months AS (
+    SELECT DISTINCT
+        accounting_month
+    FROM srm
+),
+trans AS (
+    SELECT
+        tm.accounting_month,
+        TO_CHAR(t_eff.actual_dt, 'yyyymmdd') AS tran_eff_dt,
+        p.policy_no,
+        p.policy_type_cd,
+        SUM(t.premium_am) AS trans_am
+    FROM ttransaction t
+    JOIN tpolicy p
+        ON t.policy_sk = p.policy_sk
+    JOIN tdate t_eff
+        ON t.effective_dt_sk = t_eff.date_sk
+    JOIN tdate t_tran
+        ON t.transaction_dt_sk = t_tran.date_sk
+    JOIN target_months tm
+        ON (
+            (
+                t_eff.pcs_month_acctng_ct = tm.accounting_month
+                AND t_tran.pcs_month_acctng_ct <= tm.accounting_month
+            )
+            OR (
+                t_eff.pcs_month_acctng_ct < tm.accounting_month
+                AND t_tran.pcs_month_acctng_ct = tm.accounting_month
+            )
+        )
+    WHERE p.policy_no IN (SELECT policy_no FROM policy_list)
+        AND p.source_system_sk IN (20, 21)
+        AND p.policy_type_cd IN ('HO', 'CHO', 'AU', 'PE', 'EXFL', 'PC', 'EQ', 'CAU', 'YHT')
+        AND (
+            p.policy_type_cd IN ('HO', 'CHO')
+            OR t.premium_am <> 0
+        )
+    GROUP BY
+        tm.accounting_month,
+        TO_CHAR(t_eff.actual_dt, 'yyyymmdd'),
+        p.policy_no,
+        p.policy_type_cd
+    HAVING
+        (
+            p.policy_type_cd IN ('HO', 'CHO')
+            AND SUM(t.premium_am) <> 0
+        )
+        OR p.policy_type_cd NOT IN ('HO', 'CHO')
+)
+SELECT
+    s.accounting_dt,
+    s.tran_eff_dt,
+    s.policy_no,
+    s.accounting_month,
+    s.premium_loss_ind,
+    s.srm_amount,
+    t.trans_am,
+    t.policy_type_cd,
+    NVL(s.srm_amount, 0) - NVL(t.trans_am, 0) AS amount_difference
+FROM srm s
+FULL OUTER JOIN trans t
+    ON s.policy_no = t.policy_no
+    AND s.tran_eff_dt = t.tran_eff_dt
+    AND s.accounting_month = t.accounting_month
+WHERE NVL(s.srm_amount, 0) <> NVL(t.trans_am, 0)
+ORDER BY
+    COALESCE(s.policy_no, t.policy_no),
+    COALESCE(s.tran_eff_dt, t.tran_eff_dt),
+    COALESCE(s.accounting_month, t.accounting_month);
